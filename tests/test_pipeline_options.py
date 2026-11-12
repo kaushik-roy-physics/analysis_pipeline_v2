@@ -212,6 +212,21 @@ def test_hpc_one_off_overrides_and_dry_run():
     print("ok  HPC: run.sh test passes one-off settings to every job")
 
 
+def test_power_rows_flag_the_permutation_floor():
+    """MDD rows say when a permutation test cannot reach alpha (E vs E: floor 2 / C(2E, E))."""
+    from downstream import effects as ef_mod
+    assert abs(ef_mod.permutation_floor(3) - 0.1) < 1e-12
+    assert abs(ef_mod.permutation_floor(4) - 2 / 70) < 1e-12
+    prm = ef_mod.settings({})
+    prm["power"]["experiments"] = [3, 4, 6]
+    vc = {"sd_experiment": 8.0, "sd_well": 5.0, "sd_field": 10.0}
+    rows = {r["experiments"]: r for r in ef_mod.power_table(vc, prm, 3, 5, 50.0)}
+    assert not rows[3]["permutation_can_reach_alpha"]
+    assert rows[4]["permutation_can_reach_alpha"] and rows[6]["permutation_can_reach_alpha"]
+    assert abs(rows[3]["mdd"] - 27.0) < 0.1 and abs(rows[6]["mdd"] - 15.9) < 0.1
+    print("ok  power: 3 vs 3 flagged (p floor 0.1); MDD 27.0 / 15.9 as in the compendium")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, func in list(globals().items()):

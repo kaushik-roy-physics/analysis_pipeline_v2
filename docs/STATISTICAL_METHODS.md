@@ -77,7 +77,9 @@ difference 2, 3, 4 or 6 independent experiments could reliably detect.
 ## 0. From pixels to a value per cell
 
 **Segmentation.** Cellpose-SAM, in 2-D on the DAPI maximum projection or in 3-D on
-the z-stack; masks are size-filtered on a log scale to drop debris and merges.
+the z-stack; masks smaller than the typical nucleus (on a log scale) are dropped as
+fragments and debris. The filter has no upper cut, so merged nuclei are not removed:
+look at the segmentation overlays.
 
 **Per-cell intensity.** The median of each marker's pixels inside the nuclear
 mask: robust to hot pixels and to bleed at the nuclear boundary. `dapi_norm` is
@@ -201,6 +203,11 @@ and F fields per well, the variance of a condition mean is
 σ_E²/E + σ_W²/(E·W) + σ_F²/(E·W·F); the minimum detectable difference is
 (t₁₋α/₂ + t_power)·√(2·var) with df = 2(E − 1). When σ_E cannot be estimated it is
 taken as 0 and the row says the MDD is a lower bound;
+The MDD is a t-test calculation, while the comparisons are permutation tests:
+with E vs E replicates those cannot go below p = 2 / C(2E, E), so with 3 per condition
+p < 0.05 is impossible. Each row says so (`smallest_possible_p`,
+`permutation_can_reach_alpha`), the power at a target is then 0, and the figure draws
+those points hollow.
 `power.assumed_experiment_sd` adds an explicit assumption.
 
 ## 8. Signaling readouts
