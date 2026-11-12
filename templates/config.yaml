@@ -1,0 +1,364 @@
+# =============================================================================
+# Confocal pipeline: one config for the whole experiment
+# =============================================================================
+# `defaults:` holds everything shared. `datasets:` lists the acquisition folders;
+# each entry is deep-merged over the defaults, so a 2-D MIP folder and a 3-D
+# z-stack folder, or one folder per antibody panel, live in this one file.
+# Select a subset on the command line with `--datasets <name> …`.
+# Written by the GUI (gui/app.py); safe to edit by hand.
+
+defaults:
+
+  # -------------------------------------------------------------------------
+  # Input
+  # -------------------------------------------------------------------------
+  input:
+    recursive: true              # descend into sub-directories
+    # Sibling folders that never hold input images. Pipeline output directories
+    # are skipped automatically; list anything else here (exported JPEGs, old
+    # analysis folders). This is a correctness setting as much as a speed one:
+    # with .tif in file_types, an export folder would be ingested as input data.
+    exclude_dirs: [analysis, jpegs, pngs, figures]
+    file_types: [.nd2, .tif, .tiff, .ome.tif, .oir, .czi, .lif]  # extensions treated as input images
+    # Run on a subset of the images (default: all). Seq numbers as written in the
+    # filename (Seq0042 -> 42), e.g. "0-9, 15"; wells e.g. "1-3" or "C1-C4".
+    # Both given = an image must match both. --seq / --wells override this.
+    select: {seq: null, wells: null}
+
+  # -------------------------------------------------------------------------
+  # Channel layout (0-based indices into the image's channel axis)
+  # -------------------------------------------------------------------------
+  channels:
+    dapi_index: 0                # nuclear (DAPI) channel; used for segmentation
+    has_cyto: false              # is there a cytoplasm/membrane channel?
+    cyto_index: 1                # its index (used only when has_cyto + use_cyto)
+    marker_channels: [1, 2, 3]   # channels to quantify
+
+  # -------------------------------------------------------------------------
+  # Segmentation (Cellpose-SAM)
+  # -------------------------------------------------------------------------
+  segmentation:
+    mode: 2d                     # 2d | 3d | null. null/2d → 2-D on the DAPI MIP.
+    use_cyto: false              # pass DAPI + cyto together to Cellpose (2-channel)
+    pretrained_model: null       # null → Cellpose-SAM (cpsam); or a path to a fine-tuned model
+
+    exclude_brightest_percentile: 99.9  # clip pixels above this percentile pre-segmentation
+    flow_threshold: 0.4          # ↑ keeps more masks, ↓ removes ill-defined ones
+    cellprob_threshold: 0.0      # ↓ detects dimmer nuclei, ↑ is stricter
+    min_mask_size: 15            # absolute floor (px in 2-D, voxels in 3-D)
+
+    anisotropy: null             # 3-D only: null → pixel_size_z / pixel_size_x from metadata
+    batch_size: 8
+
+    adaptive_size_filter: true   # drop masks below exp(median_log − k·IQR_upper) of log(areas)
+    adaptive_size_k: 2.5         # ↑ keeps more small masks
+    adaptive_dapi_filter: false  # also drop masks with anomalously low mean DAPI
+    adaptive_dapi_k: 2.5
+
+  # -------------------------------------------------------------------------
+  # Intensity extraction
+  # -------------------------------------------------------------------------
+  intensity:
+    normalize_by_dapi: true      # also store marker / DAPI per-nucleus ratios
+    # Detector ceiling used for the per-channel saturation check written into
+    # every joblib (and from there into analysis/field_channel_qc.csv).
+    # null → the dtype maximum, i.e. 65535 for a 16-bit camera. Set it
+    # explicitly for a camera that digitizes fewer bits into a 16-bit container:
+    # a 12-bit sensor clips at 4095 and would otherwise never register as
+    # saturated at all.
+    saturation_value: null
+
+  # -------------------------------------------------------------------------
+  # Experiment annotation (well/condition manifest)
+  # -------------------------------------------------------------------------
+  experiment:
+    manifest_basename: manifest  # written at each dataset root
+
+  # -------------------------------------------------------------------------
+  # QC figures produced by the image-processing steps
+  # -------------------------------------------------------------------------
+  visualization:
+    dpi: 300
+    overlay_clip_percentile: [1, 99]
+
+# ---------------------------------------------------------------------------
+# Datasets: one entry per acquisition folder
+# ---------------------------------------------------------------------------
+# Only state what differs from `defaults`. Names become the `dataset` column in
+# the manifest, so downstream can pool or facet across them.
+datasets: []                     # one entry per acquisition folder (written by the GUI)
+  # A z-stack folder segmented in 3-D needs nothing but its own mode:
+  #   - {name: zstacks, directory: ./zstacks, segmentation: {mode: 3d}}
+  # One folder per stain set is the simplest arrangement: just list them.
+  # Several stain sets acquired into ONE folder: declare `stain_sweeps:` in that
+  # folder's plate_map.yaml. Run `python main.py check` before processing.
+
+# ===========================================================================
+# Downstream analysis
+# ===========================================================================
+# Reads each dataset's manifest + the per-image joblibs and produces tables,
+# figures and an HTML contact sheet under `results_dir` (experiment level, so a
+# single cells.parquet covers every dataset).
+downstream:
+  # Output folder, relative to this file. auto → named after the segmentation
+  # results analyzed: ./analysis_2d, ./analysis_3d or ./analysis_2d_3d.
+  results_dir: auto
+  # Which segmentation results to analyze. Each image folder holds one
+  # segmentation (2-D or 3-D); datasets without results are left out.
+  #   auto  every dataset that has results (2-D and 3-D side by side, never pooled)
+  #   2d | 3d  only datasets whose results are in that mode
+  seg_mode: auto                 # auto | 2d | 3d | both
+  manifest_basename: manifest
+
+  # Canonicalize marker spellings so 'nkx25' and 'NKX2.5' are one marker.
+  marker_aliases: {}             # e.g. {nkx25: NKX2.5, foxf1_2: FOXF1/2}
+  # Markers NOT to analyze, by name, whatever channel they are on: e.g. E-CAD
+  # imaged together with FOXA2 in channel 1 (the stain set says which wells carry
+  # which). The nuclear channel is never analyzed.
+  exclude_markers: [DAPI]        # e.g. [DAPI, ECAD]
+  markers_order: null            # optional display order
+
+  # Which steps run by default (null → all registered steps, dependency-ordered).
+  steps: null
+  # Optional analyses to leave out (default: none, everything runs). Any of
+  # gating, distributions, composition, joint, plate, trends, effects. The core
+  # (signaling, assemble, qc, thresholds, aggregate, report) always runs. A
+  # skipped step's earlier outputs move to <analysis>/_skipped/.
+  skip_steps: []                 # e.g. [joint, plate]
+  # Experiment-specific analyses that register their own steps. Modules are
+  # imported relative to this config's directory.
+  extra_modules: []              # e.g. [downstream_analysis.custom]
+
+  # -------------------------------------------------------------------------
+  # What defines a condition, and which wells are the negative control
+  # -------------------------------------------------------------------------
+  conditions:
+    condition_key: [treatment]   # one or more plate-map columns
+    control_column: class        # plate-map column declaring control wells
+    control_values: [pluripotent, control, negative_control]
+    order: null                  # explicit condition order; null → controls first, then sorted
+
+    # --- Splitting figures instead of crowding one axis ----------------------
+    # With a crossed design (3 treatments × 4 progenitor origins) a single
+    # condition_key axis carries 12 violins and the comparison you actually want
+    #, origin *within* a treatment, is hard to read. Name the column to hold
+    # fixed here and you get one figure per value of it, with the remaining
+    # condition_key column(s) on the x-axis:
+    #
+    #   condition_key: [treatment, ps_origin]
+    #   facet_key: [treatment]        → violin_ISL1__Activin.png, …__Activin_Noggin.png
+    #
+    # Presentational only. The facet column must be part of condition_key, so
+    # every statistic is still computed on the full condition: faceting decides
+    # which panel a number is drawn in, never how it was calculated.
+    facet_key: null              # e.g. [treatment]
+
+    # --- Per-marker negative controls ---------------------------------------
+    # The blanket declaration above applies to every marker. Override it only for
+    # markers whose negative control is a DIFFERENT well: the classic case being
+    # a pluripotent well that is the negative control for BRA/CDX2 but the
+    # POSITIVE control for SOX2. Gating SOX2 off that well puts its threshold at
+    # the P99 of a saturated population and nothing is ever called positive.
+    #
+    # Prefer declaring this in plate_map.yaml, where it travels with the data:
+    #   wells:
+    #     1-6: {treatment: mTeSR, class: pluripotent, positive_for: [SOX2]}
+    #     7-9: {treatment: BMP50, control_for: [SOX2]}
+    # This block is the config-side equivalent, for reanalysis without editing a
+    # plate map. A plate-map `control_for` wins over it (and says so in the log).
+    marker_controls: {}          # e.g. {SOX2: {control_values: [bmp_high]}}
+
+  # -------------------------------------------------------------------------
+  # Intensity space per marker, and the pool its gate is estimated from
+  # -------------------------------------------------------------------------
+  # space: nuclear markers are best gated on DAPI-normalized intensity (it
+  #   removes nucleus-to-nucleus DAPI/exposure variation); membrane/cytoplasmic
+  #   markers must stay raw, where DAPI normalization is meaningless.
+  #
+  # scope: the pool a marker's threshold and band edges are estimated over:
+  #   panel       dataset × plate_id × stain_set   (default; nothing is pooled)
+  #   plate       plate_id × seg_mode              (pools panels AND datasets)
+  #   experiment  seg_mode                         (one gate everywhere)
+  #
+  #   Use `plate` when the SAME antibody at the SAME dilution appears in several
+  #   panels across the wells of one plate: e.g. [NKX2.5, ISL1, HAND1] in some
+  #   wells and [MEF2C, ISL1, HAND2] in others. Two separate ISL1 gates would
+  #   make its positive fractions incomparable between wells for no reason.
+  #   `seg_mode` stays in the key at every level, so MIPs and z-stacks of the
+  #   same cells never share a gate.
+  #
+  #   Sibling panel folders become separate datasets, so `plate` scope only pools
+  #   them when their plate maps declare the SAME explicit plate_id. Run
+  #   `python main.py check`: it names every marker that could be pooled.
+  default_space: dapi_norm       # dapi_norm | raw
+  nuclear_stain: auto            # dna | histone | auto (from the nuclear channel's name, e.g. H2B → histone).
+                                 #   A histone denominator (dapi_norm) is warned about and named in every caption
+  markers: {}                    # e.g. {TNNT2: {space: raw}, ISL1: {scope: plate}}
+
+  # -------------------------------------------------------------------------
+  # Positivity thresholds: one per scope × marker
+  # -------------------------------------------------------------------------
+  thresholds:
+    scope: panel                 # default gate scope (see `markers:` above)
+    method: control_percentile   # control_percentile (recommended) | mad
+    # The threshold is the (1 − fpr) quantile of that marker's OWN negative
+    # control: Eq. (2) of Cell_fate_classification.pdf, with fpr in place of the
+    # paper's P95. fpr: 0.01 is the control's P99.
+    fpr: 0.01                    # → the control's P99: ≤1 % of true negatives called positive
+    sigma: 4.5                   # only used by method: mad
+    min_control_cells: 200       # below this the control is not trusted → GMM fallback
+    # Leave-one-field-out gate stability. Every gate is recomputed with each
+    # control field held out in turn; exceeding this spread (percent of the gate)
+    # logs a warning naming the offending field, and the numbers land in
+    # thresholds.csv as gate_loo_min/max/spread_pct/worst_field. Fields of one
+    # control well are replicates, so a healthy gate barely moves - one that
+    # jumps is describing a single contaminated field rather than the control.
+    # Diagnostic only: the emitted threshold is never changed by this.
+    loo_warn_pct: 25
+    gmm:                         # fallback when a marker has no usable control
+      enabled: true
+      log_transform: true        # intensities are ~log-normal
+      min_cells: 200
+      min_bic_gain: 10.0         # 2-component fit must beat 1-component by this
+      min_separation: 2.0        # standardized distance between the two modes
+      min_weight: 0.05           # smallest component must hold ≥5 % of the mass
+      n_init: 3
+      random_state: 0
+    # If the mixture fails any check, NO threshold is emitted: the marker becomes
+    # 'graded_only' and no positive fraction is reported for it anywhere.
+
+  # -------------------------------------------------------------------------
+  # Graded gating (bands) and co-expression
+  # -------------------------------------------------------------------------
+  gating:
+    split: tertile               # tertile → neg/low/mid/high | median → neg/low/high
+    min_positive_cells: 50       # below this, no band edges are computed
+    pairs: auto                  # auto → every within-panel pair; or [[ISL1, NKX2.5], …]
+
+  # -------------------------------------------------------------------------
+  # Quality control
+  # -------------------------------------------------------------------------
+  qc:
+    outlier_z: 3.5               # robust z (MAD) beyond which a field is flagged
+    min_cells_per_field: 20      # fewer nuclei than this → flagged
+    cv_warn: 0.5                 # warn when field-to-field CV within a well exceeds this
+    drop_outlier_fields: false   # flag by default; set true to exclude them everywhere
+
+    # --- Per-marker channel QC (qc_marker_fields.csv) ------------------------
+    # The three settings above look only at DAPI, nucleus count and nucleus size,
+    # so an artifact confined to ONE antibody channel - a patch of non-specific
+    # staining, a laser flare, a bubble - passes them untouched. These compare
+    # each field's marker median against the other fields of its OWN well, the
+    # only comparison where disagreement must be technical: one well is one
+    # staining reaction, so its fields should agree, while different conditions
+    # are supposed to differ.
+    marker_outlier_z: 3.5        # robust z within a well x marker (defaults to outlier_z)
+    # A field must fail BOTH the z test and this relative-deviation floor to
+    # be flagged. At the 3-6 fields per well most plates carry, the MAD of a
+    # few tightly agreeing numbers collapses toward zero and a field sitting
+    # 3 % off its neighbors scores a z of 8 - the floor is what keeps the
+    # flag pointed at artifacts instead of at ordinary agreement.
+    marker_min_rel_dev: 0.25     # |field median - well median| / well median
+    max_saturated_fraction: 0.001  # >0.1 % of pixels at the detector ceiling → flagged
+    min_signal_to_background: 1.05 # nuclei this close to their own background → flagged
+    # Nuclei whose median is clipped at the detector ceiling are bright debris: left out of
+    # every analysis and listed in tables/qc_saturated_nuclei.csv.
+    drop_saturated_nuclei: true
+    saturation_ceiling: null     # null → each channel's ceiling from extraction; 4095 for 12-bit data in 16-bit files
+    saturation_fraction: 1.0     # flag at ≥ this × ceiling
+    # Nothing here drops anything. `drop_outlier_fields` acts on the field-level
+    # flags only: one bad marker channel is not a reason to discard that field's
+    # other, unaffected markers.
+
+  # -------------------------------------------------------------------------
+  # Statistics: what counts as n (never cells)
+  # -------------------------------------------------------------------------
+  # Each field is reduced to one value per marker first. Then:
+  #   auto → experiment when experiment_column names independent differentiations
+  #          and every condition has ≥ min_experiments_for_unit of them;
+  #          else wells when every condition has ≥ min_wells_for_well_unit wells
+  #          (fields of one well share seeding and staining, so they are averaged);
+  #          else fields, with a caveat written into the report.
+  stats:
+    replicate: auto              # auto | field | well | experiment
+    min_wells_for_well_unit: 3
+    experiment_column: null      # plate-map column naming independent differentiations, e.g. differentiation
+    min_experiments_for_unit: 2
+    n_bootstrap: 2000
+    n_permutations: 5000         # permutation tests (small designs are enumerated exactly)
+    min_fields: 2                # fewer replicates → no CI (reported as NaN, not a fake bar)
+    reference_condition: null    # null → the first negative control
+    random_state: 0
+
+  # -------------------------------------------------------------------------
+  # Trends: any numeric plate-map column can be the x-axis
+  # -------------------------------------------------------------------------
+  trends:
+    x: null                      # e.g. timepoint | day | dose_uM | reagent_hours
+    series: treatment            # one line per value of this column
+    facet: null                  # optional panel split, e.g. day
+    factors: null                # null → auto-detect two-level plate-map columns
+
+  # -------------------------------------------------------------------------
+  # Effects, trends, variance components and power (from every per-field number)
+  # tables/effects_{variance,power,vs_reference,trends}.csv, figures/effects/
+  # -------------------------------------------------------------------------
+  effects:
+    enabled: true
+    reference: auto              # auto: lowest level of the trend column within each group; or a condition label; null = none
+    trend_columns: auto          # numeric condition columns (dose, time) with ≥ min_levels levels; or a list
+    min_levels: 3
+    scale: auto                  # auto (log10 when positive levels span ≥ 10×) | linear | log
+    exponential_columns: []      # time columns that also get a decay time constant τ, e.g. [time_h]
+    n_boot: 2000
+    n_perm: 5000
+    power:
+      alpha: 0.05
+      power: 0.8
+      experiments: [2, 3, 4, 6]  # designs to evaluate (independent experiments per condition)
+      wells_per_experiment: null # null → as observed
+      fields_per_well: null      # null → as observed
+      assumed_experiment_sd: null  # when it cannot be estimated: × sd_well (or sd_field), e.g. 1.0
+      targets: []                # e.g. [{metric: positive_fraction, delta: 0.1}]
+
+  # -------------------------------------------------------------------------
+  # Signaling markers (beta-catenin, SMAD2/3, SMAD2, SMAD3, SMAD4, SMAD1, ...)
+  # Recognized by name, whatever the spelling (b-CAT, β-catenin, Smad2-3, ...).
+  # Read by WHERE the protein is: background-subtracted nuclear level, or the
+  # nuclear:cytoplasmic ratio from a ring around each nucleus; shown relative to
+  # the reference wells (or, with reference_values: [], in a.u.); never gated into
+  # % positive unless gate: true. Does nothing without such a marker.
+  # figures/signaling/ (ring QC), tables/signaling_reference.csv
+  # -------------------------------------------------------------------------
+  signaling:
+    enabled: true                # false → every marker is a standard marker
+    markers: {}                  # add / override: {pSMAD1: nuclear, YAP1: nc, SMAD4: none}
+    nuclear_space: background_subtracted  # nuclear readout: background_subtracted | raw | dapi_norm
+    reference_column: null       # plate-map column of the reference wells; null → conditions.control_column
+    reference_values: null       # e.g. [pluripotent]; null → conditions.control_values
+    gate: false                  # true → also fit % positive gates for signaling markers
+    pixel_size_um: null          # µm per pixel; null → image metadata
+    ring_inner_um: 1.0           # N:C cytoplasmic ring starts this far outside the nucleus...
+    ring_outer_um: 4.0           # ...and ends here (grown in-plane, split between neighbors)
+    background: local            # local = median of cell-free pixels in a band just outside the cells; image = all cell-free pixels
+    local_band_um: 60            # band width, starting free_distance_um beyond the cells
+    free_distance_um: 15         # background pixels are farther than this from every nucleus
+    min_free_px: 2000            # fewer such pixels → next method (local → image → camera offset)
+    body_k: 3.0                  # ring pixels must clear background + k·MAD (drops gaps); 0 = all
+    min_ring_px: 10              # fewer ring pixels → no N:C for that nucleus
+    qc_images: true              # signaling_rings.png per image + figures/signaling/ gallery
+    n_jobs: null                 # parallel workers; null → LSF slots, else up to 8 cores (1 = no worker processes)
+
+  # -------------------------------------------------------------------------
+  # Figures
+  # -------------------------------------------------------------------------
+  visualization:
+    dpi: 200                     # 300+ for final figures
+    cap_percentile: 99.9         # display-only outlier cap; never affects statistics
+    density_bins: 60
+    panel_cols: 4
+    scatter_size: 4
+    scatter_alpha: 0.35
+    joint_scatter_size: 2        # joint-step scatter panels (colored by a third marker)
+    joint_scatter_alpha: 0.8
+    caption: null                # free text appended to every normalization caption, e.g. the cell line
